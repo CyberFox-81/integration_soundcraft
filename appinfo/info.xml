@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  - SPDX-FileCopyrightText: 2026 Britton Couchman <brittondcouchman@gmail.com>
+  - SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+	<id>integration_soundcraft</id>
+	<name>SoundCraft integration</name>
+	<summary>Edit audio and SoundCraft sessions in Nextcloud with SoundCraft</summary>
+	<description><![CDATA[Open an audio file (WAV, AIFF, FLAC, MP3, Ogg Vorbis, AAC/M4A, CAF) or a SoundCraft session in Files with **Edit in SoundCraft** and work on it right in the browser, the way you know from a studio workstation: tracks, clips, edits and fades, the mixer with sends and plug-ins, automation, MIDI and bouncing.
+
+- An audio file opens as a new session of the same name. **Save** stores the session next to it (a .scraft file, with its audio in an *Audio Files* folder), and later saves go there. Nextcloud keeps the previous state of a session as a file version.
+- **Bounce Mix** and the exports store a file in the folder you type, in your Nextcloud.
+- Reopening a session loads its audio from your Nextcloud.
+- Read-only files open normally; saving offers a copy.
+- If someone else changes the session while you have it open, you choose whether to replace their version or save a copy.
+- Optionally, clicking an audio file or a session in Files opens it in SoundCraft.
+
+SoundCraft runs entirely in your browser as WebAssembly. Files go only between your browser and your Nextcloud, and the server needs no extra software.
+
+This is a community integration based on [SoundCraft](https://github.com/storytold/soundcraft) by the ArtCraft team, an open-source, Rust-native audio workstation. It embeds a build of SoundCraft and is not made or endorsed by the ArtCraft team.
+
+**Requirements:** a browser with WebGPU or WebGL2, and a web server that serves `.wasm` files as `application/wasm` (Nextcloud's own Apache and nginx configurations do).]]></description>
+	<version>0.1.0</version>
+	<licence>agpl</licence>
+	<author mail="brittondcouchman@gmail.com" homepage="https://github.com/CyberFox-81">Britton Couchman</author>
+	<namespace>SoundCraftIntegration</namespace>
+	<category>multimedia</category>
+	<category>files</category>
+	<category>integration</category>
+	<website>https://github.com/CyberFox-81/integration_soundcraft</website>
+	<bugs>https://github.com/CyberFox-81/integration_soundcraft/issues</bugs>
+	<repository type="git">https://github.com/CyberFox-81/integration_soundcraft.git</repository>
+	<dependencies>
+		<nextcloud min-version="33" max-version="35"/>
+	</dependencies>
+</info>

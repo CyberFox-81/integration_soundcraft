@@ -1,0 +1,971 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fcd637d..93c9f3c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3633,9 +3633,14 @@ version = "0.5.0"
+ dependencies = [
+  "eframe",
+  "egui",
++ "js-sys",
+  "log",
++ "serde_json",
++ "soundcraft-audio-io",
+  "soundcraft-engine",
++ "soundcraft-model",
+  "soundcraft-playback",
++ "soundcraft-time",
+  "soundcraft-ui-egui",
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+diff --git a/apps/soundcraft-web/Cargo.toml b/apps/soundcraft-web/Cargo.toml
+index 64cdb1a..ec474a7 100644
+--- a/apps/soundcraft-web/Cargo.toml
++++ b/apps/soundcraft-web/Cargo.toml
+@@ -17,10 +17,15 @@ path = "src/main.rs"
+ soundcraft-engine = { workspace = true }
+ soundcraft-ui-egui = { workspace = true }
+ soundcraft-playback = { workspace = true }
++soundcraft-model = { workspace = true }
++soundcraft-audio-io = { workspace = true }
++soundcraft-time = { workspace = true }
++serde_json = { workspace = true }
+ egui = { workspace = true }
+ log = { workspace = true }
+ # `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.
+ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
+ wasm-bindgen = "0.2"
+ wasm-bindgen-futures = "0.4"
+-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location"] }
++js-sys = "0.3"
++web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location", "MessageEvent", "UrlSearchParams", "Blob"] }
+diff --git a/apps/soundcraft-web/src/host.rs b/apps/soundcraft-web/src/host.rs
+new file mode 100644
+index 0000000..912f328
+--- /dev/null
++++ b/apps/soundcraft-web/src/host.rs
+@@ -0,0 +1,308 @@
++//! The `postMessage` bridge to a same-origin parent page (`?host=parent`), for pages that embed
++//! SoundCraft in an `<iframe>` (such as a Nextcloud app). Paths are the parent's (absolute,
++//! `/Music/Song.wav`): SoundCraft's file prompts, Save and Bounce use them through the engine's
++//! in-memory files (`soundcraft_engine::fs`). Messages are plain objects with a `type`:
++//!
++//! - `soundcraft:ready` (to the parent): `{ version }`, the app is listening; send a file now.
++//! - `soundcraft:open` (from the parent): `{ name, path, bytes | blob }`. A session (`.scraft`)
++//!   opens with its audio, which SoundCraft asks for with `need`. An audio file opens as a new
++//!   session of the same name with the file on a track; Save stores that session next to it.
++//! - `soundcraft:need` (to the parent): `{ paths }`, the audio files an opened session uses.
++//! - `soundcraft:file` (from the parent): `{ path, bytes | blob }` one of them, or
++//!   `{ path, error }` when it can't be read (the session opens with that file missing).
++//! - `soundcraft:save` (to the parent): `{ name, bytes, quiet }` for every file SoundCraft
++//!   writes, `name` being its path: the session, the audio files saved with it in its
++//!   `Audio Files` folder (`quiet`: stored without a notice), bounces and exports. The parent
++//!   stores them, creating folders as needed, and reports failures itself.
++//! - `soundcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
++//! - `soundcraft:failed` (to the parent): `{ error }` when the app couldn't start.
++//!
++//! Audio files dropped on the window are imported onto new tracks. Only the parent window on the
++//! page's own origin is heard or answered. In host mode the page starts with an empty session
++//! instead of the demo, and the parent guards leaving the page.
++
++use std::cell::{Cell, RefCell};
++use std::collections::{BTreeSet, VecDeque};
++use std::path::Path;
++use std::rc::Rc;
++
++use serde_json::json;
++use soundcraft_engine::fs;
++use soundcraft_ui_egui::SoundApp;
++use wasm_bindgen::JsCast as _;
++use wasm_bindgen::JsValue;
++use wasm_bindgen::closure::Closure;
++
++/// Where dropped files wait in memory while they are imported.
++const DROPPED: &str = "/.soundcraft-dropped";
++
++/// What arrived from the parent or the window, handled between frames.
++enum Incoming {
++    Open { name: String, path: String, bytes: Vec<u8> },
++    File { path: String, bytes: Option<Vec<u8>> },
++    Dropped { name: String, bytes: Vec<u8> },
++}
++
++/// An opened session waiting for its audio.
++struct Pending {
++    path: String,
++    text: String,
++    waiting: BTreeSet<String>,
++}
++
++#[derive(Clone)]
++pub struct Bridge {
++    window: web_sys::Window,
++    parent: web_sys::Window,
++    origin: String,
++    incoming: Rc<RefCell<VecDeque<Incoming>>>,
++    pending: Rc<RefCell<Option<Pending>>>,
++    /// The unsaved-changes state last reported to the parent.
++    reported: Rc<Cell<Option<bool>>>,
++}
++
++impl Bridge {
++    /// `None` when the page isn't framed (there is no parent to talk to).
++    pub fn new() -> Option<Self> {
++        let window = web_sys::window()?;
++        let parent = window.parent().ok().flatten()?;
++        if js_sys::Object::is(&parent, &window) {
++            return None;
++        }
++        let origin = window.location().origin().ok()?;
++        Some(Self { window, parent, origin, incoming: Rc::default(), pending: Rc::default(), reported: Rc::default() })
++    }
++
++    /// Hand what the engine writes to the parent, and hear files from it.
++    pub fn connect(&self, ctx: egui::Context) {
++        self.listen(ctx);
++        let bridge = self.clone();
++        fs::set_on_write(move |path: &str, bytes: &[u8]| {
++            if let Err(e) = bridge.post_save(path, bytes) {
++                log::error!("couldn't hand {path} to the page: {e}");
++            }
++        });
++    }
++
++    pub fn post_ready(&self) {
++        self.send(&[("type", "soundcraft:ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
++    }
++
++    pub fn post_failed(&self, error: &str) {
++        self.send(&[("type", "soundcraft:failed".into()), ("error", error.into())]);
++    }
++
++    /// Files dropped on the window (read asynchronously, imported between frames).
++    pub fn take_dropped(&self, ctx: &egui::Context) {
++        let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
++        for f in dropped {
++            let incoming = self.incoming.clone();
++            let ctx = ctx.clone();
++            wasm_bindgen_futures::spawn_local(async move {
++                let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Dropped.wav".into());
++                match f.bytes_async().await {
++                    Ok(bytes) => {
++                        incoming.borrow_mut().push_back(Incoming::Dropped { name, bytes });
++                        ctx.request_repaint();
++                    }
++                    Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
++                }
++            });
++        }
++    }
++
++    /// Before each frame: open what arrived, and tell the parent when unsaved changes appear or
++    /// go away.
++    pub fn sync(&self, app: &mut SoundApp) {
++        loop {
++            let next = self.incoming.borrow_mut().pop_front();
++            let Some(next) = next else { break };
++            let result = match next {
++                Incoming::Open { name, path, bytes } => self.open(app, &name, &path, bytes),
++                Incoming::File { path, bytes } => self.arrived(app, &path, bytes),
++                Incoming::Dropped { name, bytes } => import_dropped(app, &name, bytes),
++            };
++            if let Err(e) = result {
++                log::error!("{e}");
++                app.ui.status = e;
++            }
++        }
++        let dirty = app.engine.is_dirty();
++        if self.reported.get() != Some(dirty) && self.send(&[("type", "soundcraft:dirty".into()), ("dirty", dirty.into())]) {
++            self.reported.set(Some(dirty));
++        }
++    }
++
++    fn open(&self, app: &mut SoundApp, name: &str, path: &str, bytes: Vec<u8>) -> Result<(), String> {
++        let path = if path.starts_with('/') { path.to_string() } else { format!("/{name}") };
++        if has_extension(name, soundcraft_model::SESSION_EXTENSION) {
++            self.begin_session(app, &path, bytes)
++        } else {
++            open_audio(app, name, &path, bytes)
++        }
++    }
++
++    /// A session: ask the parent for its audio first.
++    fn begin_session(&self, app: &mut SoundApp, path: &str, bytes: Vec<u8>) -> Result<(), String> {
++        let text = String::from_utf8(bytes).map_err(|_| format!("{path} is not a SoundCraft session"))?;
++        let session = soundcraft_model::Session::from_json(&text).map_err(|e| format!("{path}: {e}"))?;
++        let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("/"));
++        let waiting: BTreeSet<String> = session
++            .sources
++            .iter()
++            .map(|s| if Path::new(&s.path).is_absolute() { s.path.clone() } else { dir.join(&s.path).to_string_lossy().into_owned() })
++            .collect();
++        if waiting.is_empty() {
++            return finish_session(app, path, text);
++        }
++        let paths = js_sys::Array::new();
++        for p in &waiting {
++            paths.push(&JsValue::from_str(p));
++        }
++        self.send(&[("type", "soundcraft:need".into()), ("paths", paths.into())]);
++        *self.pending.borrow_mut() = Some(Pending { path: path.to_string(), text, waiting });
++        app.ui.status = "Loading the session's audio…".into();
++        Ok(())
++    }
++
++    /// One of the session's audio files (or the news that it can't be read).
++    fn arrived(&self, app: &mut SoundApp, path: &str, bytes: Option<Vec<u8>>) -> Result<(), String> {
++        let mut pending = self.pending.borrow_mut();
++        let Some(p) = pending.as_mut() else { return Ok(()) };
++        if !p.waiting.remove(path) {
++            return Ok(());
++        }
++        if let Some(bytes) = bytes {
++            fs::put(path, bytes);
++        }
++        if !p.waiting.is_empty() {
++            return Ok(());
++        }
++        let Some(done) = pending.take() else { return Ok(()) };
++        drop(pending);
++        finish_session(app, &done.path, done.text)
++    }
++
++    fn post_save(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
++        // Audio saved with a session (in its `Audio Files` folder) is part of saving it.
++        let quiet = Path::new(path).parent().and_then(Path::file_name).is_some_and(|d| d == "Audio Files");
++        let buffer = js_sys::Uint8Array::from(bytes).buffer();
++        let message =
++            message(&[("type", "soundcraft:save".into()), ("name", path.into()), ("bytes", buffer.clone().into()), ("quiet", quiet.into())])
++                .ok_or_else(|| "couldn't build the message".to_string())?;
++        self.parent
++            .post_message_with_transfer(&message, &self.origin, &js_sys::Array::of1(&buffer))
++            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
++    }
++
++    fn listen(&self, ctx: egui::Context) {
++        let parent = self.parent.clone();
++        let origin = self.origin.clone();
++        let incoming = self.incoming.clone();
++        let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
++            if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
++                return;
++            }
++            let data = event.data();
++            let kind = string(&data, "type");
++            let path = string(&data, "path").unwrap_or_default();
++            let incoming = incoming.clone();
++            let ctx = ctx.clone();
++            match kind.as_deref() {
++                Some("soundcraft:open") => {
++                    let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Audio.wav".to_string());
++                    wasm_bindgen_futures::spawn_local(async move {
++                        match bytes(&data).await {
++                            Some(bytes) => incoming.borrow_mut().push_back(Incoming::Open { name, path, bytes }),
++                            None => log::error!("couldn't read {name} from the page"),
++                        }
++                        ctx.request_repaint();
++                    });
++                }
++                Some("soundcraft:file") => {
++                    wasm_bindgen_futures::spawn_local(async move {
++                        let bytes = bytes(&data).await;
++                        if bytes.is_none() {
++                            log::warn!("{path}: {}", string(&data, "error").unwrap_or_else(|| "not available".into()));
++                        }
++                        incoming.borrow_mut().push_back(Incoming::File { path, bytes });
++                        ctx.request_repaint();
++                    });
++                }
++                _ => {}
++            }
++        });
++        if self.window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref()).is_ok() {
++            // The listener lives as long as the page.
++            on_message.forget();
++        }
++    }
++
++    /// Post a message to the parent; false if it couldn't be sent.
++    fn send(&self, fields: &[(&str, JsValue)]) -> bool {
++        message(fields).is_some_and(|m| self.parent.post_message(&m, &self.origin).is_ok())
++    }
++}
++
++/// An audio file opens as a new session named after it, with the file on a track. Save stores
++/// the session next to the file (`Song.wav` → `Song.scraft`, its audio in `Audio Files`).
++fn open_audio(app: &mut SoundApp, name: &str, path: &str, bytes: Vec<u8>) -> Result<(), String> {
++    let ext = Path::new(name).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
++    let info = soundcraft_audio_io::probe(&bytes, ext.as_deref()).map_err(|e| format!("{name}: {e}"))?;
++    let rate = Some(info.sample_rate).filter(|r| soundcraft_time::SampleRate::COMMON.contains(r)).unwrap_or(48_000);
++    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled").to_string();
++    app.run("session.new", json!({"name": stem, "sample_rate": rate}))?;
++    fs::put(path, bytes);
++    let imported = app.run("file.import_audio", json!({"path": path}));
++    fs::remove(path);
++    imported?;
++    let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("/"));
++    app.engine.path = Some(dir.join(format!("{stem}.{}", soundcraft_model::SESSION_EXTENSION)).to_string_lossy().into_owned());
++    app.engine.mark_clean();
++    Ok(())
++}
++
++fn finish_session(app: &mut SoundApp, path: &str, text: String) -> Result<(), String> {
++    fs::put(path, text.into_bytes());
++    app.ui.status.clear();
++    app.run("session.open", json!({"path": path})).map(drop)
++}
++
++/// A file dropped on the window: imported onto a new track at the start of the session.
++fn import_dropped(app: &mut SoundApp, name: &str, bytes: Vec<u8>) -> Result<(), String> {
++    let path = format!("{DROPPED}/{name}");
++    fs::put(&path, bytes);
++    let imported = app.run("file.import_audio", json!({"path": path}));
++    fs::remove(&path);
++    imported.map(drop)
++}
++
++fn has_extension(name: &str, ext: &str) -> bool {
++    Path::new(name).extension().is_some_and(|e| e.eq_ignore_ascii_case(ext))
++}
++
++fn message(fields: &[(&str, JsValue)]) -> Option<js_sys::Object> {
++    let m = js_sys::Object::new();
++    for (key, value) in fields {
++        js_sys::Reflect::set(&m, &JsValue::from_str(key), value).ok()?;
++    }
++    Some(m)
++}
++
++fn string(data: &JsValue, key: &str) -> Option<String> {
++    js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
++}
++
++/// `bytes` (an `ArrayBuffer` or `Uint8Array`) or `blob`.
++async fn bytes(data: &JsValue) -> Option<Vec<u8>> {
++    let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
++    if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
++        return Some(array.to_vec());
++    }
++    if bytes.is_instance_of::<js_sys::ArrayBuffer>() {
++        return Some(js_sys::Uint8Array::new(&bytes).to_vec());
++    }
++    let blob = js_sys::Reflect::get(data, &JsValue::from_str("blob")).ok()?.dyn_into::<web_sys::Blob>().ok()?;
++    let buffer = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await.ok()?;
++    Some(js_sys::Uint8Array::new(&buffer).to_vec())
++}
+diff --git a/apps/soundcraft-web/src/main.rs b/apps/soundcraft-web/src/main.rs
+index cb089a5..a0e6b45 100644
+--- a/apps/soundcraft-web/src/main.rs
++++ b/apps/soundcraft-web/src/main.rs
+@@ -12,9 +12,13 @@
+ //!   playback is heard.
+ //!
+ //! URL query flags: `?webgl` forces the WebGL2 backend instead of WebGPU; `?empty` starts with an
+-//! empty session instead of the demo.
++//! empty session instead of the demo; `?host=parent` (inside an `<iframe>`) talks to a same-origin
++//! parent page instead: it sends the session or audio file to open and stores what SoundCraft
++//! saves (`host`).
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+ 
++#[cfg(target_arch = "wasm32")]
++mod host;
+ #[cfg(target_arch = "wasm32")]
+ mod web;
+ 
+diff --git a/apps/soundcraft-web/src/web.rs b/apps/soundcraft-web/src/web.rs
+index 78acba4..113bac3 100644
+--- a/apps/soundcraft-web/src/web.rs
++++ b/apps/soundcraft-web/src/web.rs
+@@ -25,6 +25,10 @@ pub fn start() {
+         {
+             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+         }
++        // `?host=parent`: a same-origin page framing SoundCraft (such as a Nextcloud app) opens
++        // sessions and audio files in it and stores what it saves (`host`).
++        let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
++        let app_bridge = bridge.clone();
+         let result = eframe::WebRunner::new()
+             .start(
+                 canvas,
+@@ -33,13 +37,22 @@ pub fn start() {
+                     if let Some(rs) = &cc.wgpu_render_state {
+                         log::info!("soundcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
+                     }
+-                    let engine = if query().contains("empty") { Engine::default() } else { soundcraft_engine::demo::demo_engine() };
++                    // In host mode the parent sends the file to edit; no demo meanwhile.
++                    let engine =
++                        if app_bridge.is_some() || query().contains("empty") { Engine::default() } else { soundcraft_engine::demo::demo_engine() };
+                     let player = soundcraft_playback::Player::new(Arc::new(engine.session().clone()));
+                     let app = SoundApp::new(engine, Some(player), Services::default());
+-                    Ok(Box::new(WebShell(app)))
++                    if let Some(bridge) = &app_bridge {
++                        bridge.connect(cc.egui_ctx.clone());
++                        bridge.post_ready();
++                    }
++                    Ok(Box::new(WebShell { app, bridge: app_bridge }))
+                 }),
+             )
+             .await;
++        if let (Err(e), Some(bridge)) = (&result, &bridge) {
++            bridge.post_failed(&format!("{e:?}"));
++        }
+         if let Some(el) = document.get_element_by_id(LOADING_ID) {
+             match result {
+                 Ok(()) => el.remove(),
+@@ -53,18 +66,29 @@ fn query() -> String {
+     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+ }
+ 
+-struct WebShell(SoundApp);
++fn query_param(key: &str) -> Option<String> {
++    web_sys::UrlSearchParams::new_with_str(&query()).ok()?.get(key)
++}
++
++struct WebShell {
++    app: SoundApp,
++    bridge: Option<crate::host::Bridge>,
++}
+ 
+ impl eframe::App for WebShell {
+     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+-        self.0.logic(ctx);
++        if let Some(bridge) = &self.bridge {
++            bridge.take_dropped(ctx);
++            bridge.sync(&mut self.app);
++        }
++        self.app.logic(ctx);
+     }
+ 
+     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+-        self.0.raw_input_hook(raw);
++        self.app.raw_input_hook(raw);
+     }
+ 
+     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+-        self.0.ui(ui);
++        self.app.ui(ui);
+     }
+ }
+diff --git a/crates/engine/src/clip_group_file.rs b/crates/engine/src/clip_group_file.rs
+index c889c99..5caa917 100644
+--- a/crates/engine/src/clip_group_file.rs
++++ b/crates/engine/src/clip_group_file.rs
+@@ -62,10 +62,10 @@ pub fn export(e: &Engine, ids: &[ClipId], path: &str) -> Result<usize> {
+                 && let (Some(buf), Some(src)) = (s.pool.get(source), s.sources.iter().find(|x| x.id == source))
+             {
+                 let rel = format!("{audio_dir_name}/{}_{}.wav", crate::io::sanitize_name(&src.name), source.0);
+-                std::fs::create_dir_all(dir.join(&audio_dir_name)).map_err(|err| EngineError::Io(format!("{audio_dir_name}: {err}")))?;
++                crate::fs::create_dir_all(dir.join(&audio_dir_name)).map_err(|err| EngineError::Io(format!("{audio_dir_name}: {err}")))?;
+                 let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
+                 let bytes = soundcraft_audio_io::encode(&buf.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
+-                std::fs::write(dir.join(&rel), bytes).map_err(|err| EngineError::Io(format!("{rel}: {err}")))?;
++                crate::fs::write(dir.join(&rel), bytes).map_err(|err| EngineError::Io(format!("{rel}: {err}")))?;
+                 slot.insert(rel);
+             }
+             lane.push(c);
+@@ -74,7 +74,7 @@ pub fn export(e: &Engine, ids: &[ClipId], path: &str) -> Result<usize> {
+     }
+     let file = GroupFile { format: FORMAT.into(), version: 1, sample_rate: s.sample_rate.hz(), length: end - start, lanes: out_lanes, audio };
+     let text = serde_json::to_string_pretty(&file).map_err(|err| EngineError::Io(err.to_string()))?;
+-    std::fs::write(&p, text).map_err(|err| EngineError::Io(format!("{}: {err}", p.display())))?;
++    crate::fs::write(&p, text).map_err(|err| EngineError::Io(format!("{}: {err}", p.display())))?;
+     Ok(n)
+ }
+ 
+@@ -82,7 +82,7 @@ pub fn export(e: &Engine, ids: &[ClipId], path: &str) -> Result<usize> {
+ /// are made when the session runs out). Returns the ids of the placed clips.
+ pub fn import(e: &mut Engine, path: &str, first: Option<TrackId>, at: Samples) -> Result<Vec<ClipId>> {
+     let id = "file.import_clip_groups";
+-    let text = std::fs::read_to_string(path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++    let text = crate::fs::read_to_string(path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+     let file: GroupFile = serde_json::from_str(&text).map_err(|err| EngineError::BadParams(id.into(), format!("not a clip group file: {err}")))?;
+     if file.format != FORMAT {
+         return Err(EngineError::BadParams(id.into(), "not a SoundCraft clip group file".into()));
+@@ -98,7 +98,7 @@ pub fn import(e: &mut Engine, path: &str, first: Option<TrackId>, at: Samples) -
+         if !full.starts_with(&dir) || rel.contains("..") {
+             return Err(EngineError::BadParams(id.into(), format!("audio path escapes the group folder: {rel}")));
+         }
+-        let bytes = std::fs::read(&full).map_err(|err| EngineError::Io(format!("{}: {err}", full.display())))?;
++        let bytes = crate::fs::read(&full).map_err(|err| EngineError::Io(format!("{}: {err}", full.display())))?;
+         let (_, buf) = soundcraft_audio_io::decode(&bytes, Some("wav")).map_err(|err| EngineError::Io(format!("{rel}: {err}")))?;
+         decoded.insert(*old, (rel.clone(), buf));
+     }
+diff --git a/crates/engine/src/cmd/file.rs b/crates/engine/src/cmd/file.rs
+index d58af41..61d1839 100644
+--- a/crates/engine/src/cmd/file.rs
++++ b/crates/engine/src/cmd/file.rs
+@@ -39,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
+             s.sources.clear();
+             s.videos.clear();
+             let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
+-            std::fs::write(&path, text).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++            crate::fs::write(&path, text).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+             Ok(json!({"path": path}))
+         }),
+         cmd!(noundo "session.revert", "Revert Session to Saved...", ["File"], None, "{}", always, |e, _| {
+@@ -59,7 +59,7 @@ pub fn specs() -> Vec<CommandSpec> {
+         cmd!("file.import_midi", "MIDI...", ["File", "Import"], Some("Cmd+Alt+I"), "{path, at?}", always, |e, p| {
+             let path = str_param(p, "path").ok_or_else(|| bad("file.import_midi", "`path` required"))?.to_string();
+             let at = position_param(e, "file.import_midi", p, "at")?.unwrap_or(0);
+-            let bytes = std::fs::read(&path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++            let bytes = crate::fs::read(&path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+             let tracks = crate::io::import_midi_bytes(e, &bytes, at, bool_or(p, "tempo_map", true))?;
+             Ok(json!({"tracks": tracks}))
+         }),
+@@ -73,7 +73,7 @@ pub fn specs() -> Vec<CommandSpec> {
+             |e, p| {
+                 let path = str_param(p, "path").ok_or_else(|| bad("file.import_video", "`path` required"))?.to_string();
+                 let at = position_param(e, "file.import_video", p, "at")?.unwrap_or(0).max(0);
+-                let bytes = std::fs::read(&path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++                let bytes = crate::fs::read(&path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+                 crate::io::import_video_bytes(e, &path, bytes, at)
+             }
+         ),
+@@ -99,13 +99,13 @@ pub fn specs() -> Vec<CommandSpec> {
+         cmd!(noundo "file.export_midi", "MIDI...", ["File", "Export"], None, "{path, tracks?}", always, |e, p| {
+             let path = str_param(p, "path").ok_or_else(|| bad("file.export_midi", "`path` required"))?.to_string();
+             let bytes = crate::io::export_midi(e)?;
+-            std::fs::write(&path, &bytes).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++            crate::fs::write(&path, &bytes).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+             Ok(json!({"path": path, "bytes": bytes.len()}))
+         }),
+         cmd!(noundo "file.export_session_text", "Session Info as Text...", ["File", "Export"], None, "{path?}", always, |e, p| {
+             let text = crate::inspect::session_text(e);
+             if let Some(path) = str_param(p, "path") {
+-                std::fs::write(path, &text).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++                crate::fs::write(path, &text).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+             }
+             Ok(json!({"text": text}))
+         }),
+@@ -211,7 +211,7 @@ fn import_audio(e: &mut Engine, p: &Value) -> Result<Value> {
+     let target = import_audio_target(e, p)?;
+     let mut out = Vec::new();
+     for path in &paths {
+-        let bytes = std::fs::read(path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++        let bytes = crate::fs::read(path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+         let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
+         let r = crate::io::import_audio_bytes(e, &name, &bytes, Some(path.as_str()), target, at)?;
+         out.push(r);
+@@ -261,7 +261,7 @@ fn bounce(e: &mut Engine, p: &Value) -> Result<Value> {
+     let normalize = bool_or(p, "normalize", false);
+     let fold = fold_down_param(p, "file.bounce_mix")?;
+     let (bytes, stats) = crate::io::bounce_bytes_with(e, r, &opts, normalize, fold)?;
+-    std::fs::write(&path, &bytes).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++    crate::fs::write(&path, &bytes).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+     Ok(
+         json!({"path": path, "bytes": bytes.len(), "seconds": e.session().sample_rate.seconds(r.len()), "peak_db": stats.0, "lufs": stats.1, "true_peak_db": stats.2}),
+     )
+@@ -280,7 +280,7 @@ fn write_score(e: &mut Engine, p: &Value, id: &str, svg: bool) -> Result<Value>
+         Some(p) => p.to_string(),
+         None => std::env::temp_dir().join(format!("{}.{ext}", crate::io::sanitize_name(&setup.title))).to_string_lossy().to_string(),
+     };
+-    std::fs::write(&path, &text).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++    crate::fs::write(&path, &text).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+     let measures = parts.iter().map(|p| p.measures.len()).max().unwrap_or(0);
+     Ok(json!({"path": path, "parts": parts.len(), "measures": measures}))
+ }
+diff --git a/crates/engine/src/fs.rs b/crates/engine/src/fs.rs
+new file mode 100644
+index 0000000..cea3505
+--- /dev/null
++++ b/crates/engine/src/fs.rs
+@@ -0,0 +1,242 @@
++//! File access for the engine's open, save, import and export commands.
++//!
++//! Native builds use the real file system. The browser (wasm32) has none: there, files live in
++//! memory, and only once a host page has asked for that with [`set_on_write`] (the web shell's
++//! `?host=parent` mode, for pages such as a Nextcloud app that frame SoundCraft). The host puts
++//! the files a session needs with [`put`] and is handed every file the engine writes, under the
++//! same path. Without a host, browser writes fail as they always have.
++
++use std::io;
++use std::path::Path;
++
++/// Read a whole file.
++pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
++    #[cfg(target_arch = "wasm32")]
++    {
++        memory::with(|s| s.read(path.as_ref()))
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        std::fs::read(path)
++    }
++}
++
++/// Read a whole UTF-8 text file.
++pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
++    String::from_utf8(read(path)?).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
++}
++
++/// Write a whole file, replacing it.
++pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Result<()> {
++    #[cfg(target_arch = "wasm32")]
++    {
++        let written = memory::with(|s| s.write(path.as_ref(), bytes.as_ref().to_vec()))?;
++        memory::notify(written);
++        Ok(())
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        std::fs::write(path, bytes)
++    }
++}
++
++/// Rename a file (used to replace a file in one step after writing a temporary one).
++pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
++    #[cfg(target_arch = "wasm32")]
++    {
++        let written = memory::with(|s| s.rename(from.as_ref(), to.as_ref()))?;
++        memory::notify(written);
++        Ok(())
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        std::fs::rename(from, to)
++    }
++}
++
++/// Create a folder and its parents.
++pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
++    #[cfg(target_arch = "wasm32")]
++    {
++        // Folders exist implicitly in memory; the host creates them as it stores files.
++        let _ = path;
++        memory::with(|s| s.writable()).map(|_| ())
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        std::fs::create_dir_all(path)
++    }
++}
++
++/// Whether a file (native: or folder) exists.
++pub fn exists(path: impl AsRef<Path>) -> bool {
++    #[cfg(target_arch = "wasm32")]
++    {
++        memory::with(|s| s.exists(path.as_ref()))
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        path.as_ref().exists()
++    }
++}
++
++/// Browser: a file the host provides (an opened session's audio, a file to import). Putting a
++/// file doesn't count as the engine writing it.
++#[cfg(target_arch = "wasm32")]
++pub fn put(path: impl AsRef<Path>, bytes: Vec<u8>) {
++    memory::with(|s| s.put(path.as_ref(), bytes));
++}
++
++/// Browser: forget a file put with [`put`] that is no longer needed.
++#[cfg(target_arch = "wasm32")]
++pub fn remove(path: impl AsRef<Path>) {
++    memory::with(|s| s.remove(path.as_ref()));
++}
++
++/// Browser: let the engine write files, handing each one (path, bytes) to `on_write` once it is
++/// complete. Temporary files (`*.tmp`) aren't handed over; renaming one is.
++#[cfg(target_arch = "wasm32")]
++pub fn set_on_write(on_write: impl Fn(&str, &[u8]) + 'static) {
++    memory::with(|s| s.on_write = Some(std::rc::Rc::new(on_write)));
++}
++
++/// The browser's in-memory files. Built everywhere so it is tested natively.
++#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
++mod memory {
++    use std::cell::RefCell;
++    use std::collections::HashMap;
++    use std::io;
++    use std::path::{Component, Path};
++    use std::rc::Rc;
++
++    type OnWrite = Rc<dyn Fn(&str, &[u8])>;
++
++    /// A finished write for the host: called outside the store's borrow.
++    pub type Written = Option<(OnWrite, String, Rc<Vec<u8>>)>;
++
++    #[derive(Default)]
++    pub struct Store {
++        files: HashMap<String, Rc<Vec<u8>>>,
++        pub on_write: Option<OnWrite>,
++    }
++
++    thread_local! {
++        static STORE: RefCell<Store> = RefCell::new(Store::default());
++    }
++
++    pub fn with<T>(f: impl FnOnce(&mut Store) -> T) -> T {
++        STORE.with(|s| f(&mut s.borrow_mut()))
++    }
++
++    pub fn notify(written: Written) {
++        if let Some((on_write, path, bytes)) = written {
++            on_write(&path, &bytes);
++        }
++    }
++
++    /// `/a/./b/../c` → `/a/c`; relative paths stay relative.
++    pub fn key(path: &Path) -> String {
++        let mut parts: Vec<String> = Vec::new();
++        let mut absolute = false;
++        for c in path.components() {
++            match c {
++                Component::RootDir | Component::Prefix(_) => absolute = true,
++                Component::CurDir => {}
++                Component::ParentDir => {
++                    parts.pop();
++                }
++                Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
++            }
++        }
++        let joined = parts.join("/");
++        if absolute { format!("/{joined}") } else { joined }
++    }
++
++    fn unsupported() -> io::Error {
++        io::Error::new(io::ErrorKind::Unsupported, "the browser has no file system")
++    }
++
++    fn is_temporary(key: &str) -> bool {
++        Path::new(key).extension().is_some_and(|e| e.eq_ignore_ascii_case("tmp"))
++    }
++
++    impl Store {
++        pub fn writable(&self) -> io::Result<OnWrite> {
++            self.on_write.clone().ok_or_else(unsupported)
++        }
++
++        pub fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
++            let k = key(path);
++            self.files
++                .get(&k)
++                .map(|b| b.as_ref().clone())
++                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{k} is not available in the browser")))
++        }
++
++        pub fn write(&mut self, path: &Path, bytes: Vec<u8>) -> io::Result<Written> {
++            let on_write = self.writable()?;
++            let k = key(path);
++            let bytes = Rc::new(bytes);
++            self.files.insert(k.clone(), bytes.clone());
++            Ok((!is_temporary(&k)).then_some((on_write, k, bytes)))
++        }
++
++        pub fn rename(&mut self, from: &Path, to: &Path) -> io::Result<Written> {
++            let on_write = self.writable()?;
++            let (from, to) = (key(from), key(to));
++            let bytes = self.files.remove(&from).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{from} doesn't exist")))?;
++            self.files.insert(to.clone(), bytes.clone());
++            Ok((!is_temporary(&to)).then_some((on_write, to, bytes)))
++        }
++
++        pub fn exists(&self, path: &Path) -> bool {
++            self.files.contains_key(&key(path))
++        }
++
++        pub fn put(&mut self, path: &Path, bytes: Vec<u8>) {
++            self.files.insert(key(path), Rc::new(bytes));
++        }
++
++        pub fn remove(&mut self, path: &Path) {
++            self.files.remove(&key(path));
++        }
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++        use std::cell::RefCell;
++
++        #[test]
++        fn keys_are_normalized() {
++            assert_eq!(key(Path::new("/Music/./Audio Files/../Song.scraft")), "/Music/Song.scraft");
++            assert_eq!(key(&Path::new("/Music").join("Audio Files/a.wav")), "/Music/Audio Files/a.wav");
++            assert_eq!(key(Path::new("Audio Files/a.wav")), "Audio Files/a.wav");
++            assert_eq!(key(Path::new("/../..")), "/");
++        }
++
++        #[test]
++        fn writes_need_a_host() {
++            let mut s = Store::default();
++            assert_eq!(s.write(Path::new("/a.wav"), vec![1]).err().map(|e| e.kind()), Some(io::ErrorKind::Unsupported));
++            assert!(!s.exists(Path::new("/a.wav")));
++            s.put(Path::new("/b.wav"), vec![2]);
++            assert_eq!(s.read(Path::new("/b.wav")).ok(), Some(vec![2]));
++            assert_eq!(s.read(Path::new("/c.wav")).err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
++        }
++
++        #[test]
++        fn the_host_gets_finished_files_only() {
++            let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::default();
++            let mut s = Store::default();
++            let sink = got.clone();
++            s.on_write = Some(Rc::new(move |p: &str, b: &[u8]| sink.borrow_mut().push((p.to_string(), b.to_vec()))));
++            notify(s.write(Path::new("/S/Audio Files/a.wav"), vec![1]).ok().flatten());
++            notify(s.write(Path::new("/S/x.scraft.tmp"), b"{}".to_vec()).ok().flatten());
++            notify(s.rename(Path::new("/S/x.scraft.tmp"), Path::new("/S/x.scraft")).ok().flatten());
++            assert_eq!(got.borrow().clone(), vec![("/S/Audio Files/a.wav".to_string(), vec![1]), ("/S/x.scraft".to_string(), b"{}".to_vec())]);
++            assert!(s.exists(Path::new("/S/x.scraft")) && !s.exists(Path::new("/S/x.scraft.tmp")));
++            assert!(s.rename(Path::new("/missing.tmp"), Path::new("/m")).is_err());
++        }
++    }
++}
+diff --git a/crates/engine/src/io.rs b/crates/engine/src/io.rs
+index cb3fc18..a131039 100644
+--- a/crates/engine/src/io.rs
++++ b/crates/engine/src/io.rs
+@@ -252,7 +252,7 @@ pub fn bounce_stems(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions) -> Re
+ /// [`bounce_stems`] in the main format, or folded down to stereo when `fold_stereo`.
+ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, fold_stereo: bool) -> Result<Vec<String>> {
+     let s = e.session();
+-    std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{dir}: {err}")))?;
++    crate::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{dir}: {err}")))?;
+     let ext = match opts.format {
+         FileFormat::Aiff => "aif",
+         FileFormat::Flac => "flac",
+@@ -274,7 +274,7 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions,
+         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
+         let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf, opts, fmt.channel_mask()).map_err(|err| EngineError::Io(err.to_string()))?;
+         let path = Path::new(dir).join(format!("{} - {}.{ext}", sanitize_name(&s.name), sanitize_name(&name)));
+-        std::fs::write(&path, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
++        crate::fs::write(&path, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
+         out.push(path.to_string_lossy().into_owned());
+     }
+     Ok(out)
+@@ -425,7 +425,7 @@ pub fn commit_track(e: &mut Engine, t: TrackId) -> Result<Option<TrackId>> {
+ 
+ pub fn export_clips(e: &Engine, ids: &[soundcraft_model::ClipId], dir: &str) -> Result<usize> {
+     let s = e.session();
+-    std::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{dir}: {err}")))?;
++    crate::fs::create_dir_all(dir).map_err(|err| EngineError::Io(format!("{dir}: {err}")))?;
+     let mut n = 0;
+     for id in ids {
+         let Some((t, c)) = s.find_clip(*id) else { continue };
+@@ -435,14 +435,14 @@ pub fn export_clips(e: &Engine, ids: &[soundcraft_model::ClipId], dir: &str) ->
+         let stem = sanitize_name(&c.name);
+         let mut path = Path::new(dir).join(format!("{stem}.wav"));
+         let mut k = 2u32;
+-        while path.exists() {
++        while crate::fs::exists(&path) {
+             path = Path::new(dir).join(format!("{stem}-{k}.wav"));
+             k = k.saturating_add(1);
+             if k > 10_000 {
+                 return Err(EngineError::Io(format!("{dir}: too many files named {stem}")));
+             }
+         }
+-        std::fs::write(&path, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
++        crate::fs::write(&path, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
+         n += 1;
+     }
+     Ok(n)
+@@ -482,24 +482,24 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
+     let mut written = 0;
+     for src in &mut s.sources {
+         let rel_target = format!("Audio Files/{}.wav", sanitize_name(&src.name));
+-        let exists_rel = !Path::new(&src.path).is_absolute() && dir.join(&src.path).exists();
++        let exists_rel = !Path::new(&src.path).is_absolute() && crate::fs::exists(dir.join(&src.path));
+         if exists_rel && !src.unsaved {
+             continue;
+         }
+         let Some(audio) = s.pool.get(src.id) else { continue };
+-        std::fs::create_dir_all(&audio_dir).map_err(|err| EngineError::Io(format!("{}: {err}", audio_dir.display())))?;
++        crate::fs::create_dir_all(&audio_dir).map_err(|err| EngineError::Io(format!("{}: {err}", audio_dir.display())))?;
+         let mut target = rel_target.clone();
+         if overwrite {
+             // One file per source id so autosaves never collide or pile up.
+             target = format!("Audio Files/{}_{}.wav", sanitize_name(&src.name), src.id.0);
+-            if dir.join(&target).exists() {
++            if crate::fs::exists(dir.join(&target)) {
+                 src.path = target;
+                 src.unsaved = false;
+                 continue;
+             }
+         } else {
+             let mut k = 1;
+-            while dir.join(&target).exists() && !(exists_rel && target == src.path) {
++            while crate::fs::exists(dir.join(&target)) && !(exists_rel && target == src.path) {
+                 target = format!("Audio Files/{}_{k:02}.wav", sanitize_name(&src.name));
+                 k += 1;
+                 if k > 999 {
+@@ -509,7 +509,7 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
+         }
+         let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
+         let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
+-        std::fs::write(dir.join(&target), bytes).map_err(|err| EngineError::Io(format!("{target}: {err}")))?;
++        crate::fs::write(dir.join(&target), bytes).map_err(|err| EngineError::Io(format!("{target}: {err}")))?;
+         src.path = target;
+         src.unsaved = false;
+         src.format = FileFormat::Wav;
+@@ -521,20 +521,20 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
+     let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
+     // Atomic-ish write: temp file then rename.
+     let tmp = p.with_extension("scraft.tmp");
+-    std::fs::write(&tmp, text).map_err(|err| EngineError::Io(format!("{}: {err}", tmp.display())))?;
+-    std::fs::rename(&tmp, &p).map_err(|err| EngineError::Io(format!("{}: {err}", p.display())))?;
++    crate::fs::write(&tmp, text).map_err(|err| EngineError::Io(format!("{}: {err}", tmp.display())))?;
++    crate::fs::rename(&tmp, &p).map_err(|err| EngineError::Io(format!("{}: {err}", p.display())))?;
+     Ok((s, written, p))
+ }
+ 
+ /// Open a `.scraft` session and decode its audio files (missing files are reported, not fatal).
+ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
+-    let text = std::fs::read_to_string(path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
++    let text = crate::fs::read_to_string(path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;
+     let dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+     let mut missing = Vec::new();
+     for src in s.sources.clone() {
+         let p = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
+-        match std::fs::read(&p) {
++        match crate::fs::read(&p) {
+             Ok(bytes) => match soundcraft_audio_io::decode(&bytes, p.extension().and_then(|x| x.to_str())) {
+                 Ok((_, mut buf)) => {
+                     if buf.sample_rate != s.sample_rate.hz() && buf.sample_rate > 0 {
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index f12901d..33bf8e1 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -11,6 +11,7 @@ pub mod clip_group_file;
+ pub mod cmd;
+ pub mod demo;
+ pub mod edit;
++pub mod fs;
+ pub mod inspect;
+ pub mod io;
+ pub mod score;
+diff --git a/crates/ui-egui/src/dialogs.rs b/crates/ui-egui/src/dialogs.rs
+index d212634..a16a7b2 100644
+--- a/crates/ui-egui/src/dialogs.rs
++++ b/crates/ui-egui/src/dialogs.rs
+@@ -59,7 +59,7 @@ impl Dialogs {
+ 
+     /// Open the dialog for a command; false when the command has no dialog.
+     pub fn open_for_command(&mut self, e: &Engine, id: &str) -> bool {
+-        let home = default_dir();
++        let home = session_dir(e).unwrap_or_else(default_dir);
+         let name = e.session().name.clone();
+         self.open = Some(match id {
+             "track.new" => {
+@@ -146,6 +146,21 @@ fn path_dialog(id: &str, home: &str, name: &str) -> Option<Dialog> {
+     Some(Dialog::PathPrompt { cmd: id.into(), title, path, key: key.into() })
+ }
+ 
++/// Browser: paths are the host page's (see `soundcraft_engine::fs`), so file prompts start in the
++/// open session's folder. Native prompts start in the home folder.
++fn session_dir(e: &Engine) -> Option<String> {
++    #[cfg(target_arch = "wasm32")]
++    {
++        let dir = std::path::Path::new(e.path.as_deref()?).parent()?.to_string_lossy().trim_end_matches('/').to_string();
++        Some(dir)
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    {
++        let _ = e;
++        None
++    }
++}
++
+ fn default_dir() -> String {
+     #[cfg(not(target_arch = "wasm32"))]
+     {
