@@ -10,9 +10,9 @@
 	<summary>Edit audio and SoundCraft sessions in Nextcloud with SoundCraft</summary>
 	<description><![CDATA[Open an audio file (WAV, AIFF, FLAC, MP3, Ogg Vorbis, AAC/M4A, CAF) or a SoundCraft session in Files with **Edit in SoundCraft** and work on it right in the browser, the way you know from a studio workstation: tracks, clips, edits and fades, the mixer with sends and plug-ins, automation, MIDI and bouncing.
 
-- An audio file opens as a new session of the same name. **Save** stores the session next to it (a .scraft file, with its audio in an *Audio Files* folder), and later saves go there. Nextcloud keeps the previous state of a session as a file version.
-- **Bounce Mix** and the exports store a file in the folder you type, in your Nextcloud.
-- Reopening a session loads its audio from your Nextcloud.
+- **Save** stores the session as one file, a SoundCraft session bundle (.scraftz) holding the session and its audio, and Nextcloud keeps its previous state as a file version. An audio file opens as a new session of the same name; the first Save asks for the bundle's name and folder (it's offered next to the audio file).
+- Sessions saved by SoundCraft on a computer (a .scraft file with its Audio Files folder, synced to Nextcloud) open with their audio, and save as a bundle next to them.
+- **Bounce Mix** and the exports store a file in any folder you pick.
 - Read-only files open normally; saving offers a copy.
 - If someone else changes the session while you have it open, you choose whether to replace their version or save a copy.
 - Optionally, clicking an audio file or a session in Files opens it in SoundCraft.
@@ -22,7 +22,7 @@ SoundCraft runs entirely in your browser as WebAssembly. Files go only between y
 This is a community integration based on [SoundCraft](https://github.com/storytold/soundcraft) by the ArtCraft team, an open-source, Rust-native audio workstation. It embeds a build of SoundCraft and is not made or endorsed by the ArtCraft team.
 
 **Requirements:** a browser with WebGPU or WebGL2, and a web server that serves `.wasm` files as `application/wasm` (Nextcloud's own Apache and nginx configurations do).]]></description>
-	<version>0.1.0</version>
+	<version>0.1.1</version>
 	<licence>agpl</licence>
 	<author mail="brittondcouchman@gmail.com" homepage="https://github.com/CyberFox-81">Britton Couchman</author>
 	<namespace>SoundCraftIntegration</namespace>

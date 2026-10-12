@@ -23,7 +23,7 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOUNDCRAFT_REF="${SOUNDCRAFT_REF:-7414719f3760de1c9359ec9723351a7232442e61}"
+SOUNDCRAFT_REF="${SOUNDCRAFT_REF:-acb08ff5f00d654a5303194ad04dad799c68a9fb}"
 SRC="${1:-$APP_DIR/build/soundcraft}"
 PATCH="$APP_DIR/patches/soundcraft-nextcloud.patch"
 OUT="$APP_DIR/web"
@@ -35,9 +35,12 @@ if [ ! -e "$SRC/.git" ]; then
 fi
 
 if grep -rq 'soundcraft:ready' "$SRC/apps/soundcraft-web/src"; then
-	echo "bridge patch already applied"
-else
+	echo "SoundCraft has the embedding bridge"
+elif [ -s "$PATCH" ]; then
 	git -C "$SRC" apply "$PATCH"
+else
+	echo "error: this SoundCraft has no embedding bridge, and there is no patch to add it" >&2
+	exit 1
 fi
 
 cargo_args=(build --profile release -p soundcraft-web --target wasm32-unknown-unknown)

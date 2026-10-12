@@ -6,11 +6,11 @@
 
 Open and edit the files in your Nextcloud with [SoundCraft](https://github.com/storytold/soundcraft), the open-source, Rust-native audio workstation, without leaving the browser.
 
-- **Edit in SoundCraft** appears in the Files action menu of every audio file SoundCraft reads (WAV/BWF, AIFF, FLAC, MP3, Ogg Vorbis, AAC/M4A, CAF) and of every SoundCraft session (.scraft).
-- An audio file opens as a new session named after it, with the file on a track. **Save** (Ctrl/⌘+S) stores the session next to the file as `<name>.scraft`, with its audio in an *Audio Files* folder beside it, as SoundCraft does on the desktop; the original audio file stays as it is. Later saves go to the session, and Nextcloud keeps its previous state as a file version.
-- Opening a session loads the audio files it uses from your Nextcloud; files that can't be read are reported as missing.
-- File prompts (**Save Session As**, **Bounce Mix**, the exports) take paths in your Nextcloud and start in the session's folder; missing folders are created.
-- Drop audio files from your computer on the window to import them onto new tracks.
+- **Edit in SoundCraft** appears in the Files action menu of every audio file SoundCraft reads (WAV/BWF, AIFF, FLAC, MP3, Ogg Vorbis, AAC/M4A, CAF) and of every SoundCraft session: a bundle (.scraftz) or a session folder's .scraft file.
+- **Save** (Ctrl/⌘+S) stores the session as one bundle file (.scraftz: the session and all its audio), as SoundCraft does in the browser, and Nextcloud keeps the previous state as a file version. An audio file opens as a new session named after it; its first Save asks for the bundle's name and folder (offered next to the audio file), and later saves go there. The original audio file stays as it is.
+- A session saved by SoundCraft on a computer (a .scraft file next to its *Audio Files* folder, for example synced to Nextcloud) opens with its audio, read from your Nextcloud; files that can't be read are reported as missing. Saving it creates a bundle next to it and leaves the folder as it is.
+- **Bounce Mix** and the exports (MIDI, score, session text…) ask for a name and folder in your Nextcloud the first time.
+- **File › Import** and dropping files on the window add audio and MIDI from your computer.
 - If someone else changes the file while you have it open, saving asks whether to replace their version or save a copy.
 - Read-only files (for example a share without edit rights) open normally; saving offers a copy.
 - Optionally, clicking a session in Files opens it in SoundCraft: tick **Open audio files and sessions here from Files** in the editor's top bar.
@@ -99,7 +99,7 @@ Every new version also goes to [nextcloud_plugins](https://github.com/CyberFox-8
 
 - SoundCraft is young; see its [roadmap](https://github.com/storytold/soundcraft/blob/main/ROADMAP.md) for what's still missing.
 - One person edits at a time. There is no live co-editing; concurrent saves are caught and you choose what happens.
-- **File › Import** can't read files from your Nextcloud by path in the browser: drop the files on the window instead.
+- File › Import reads files from your computer, not from your Nextcloud.
 - Plug-ins are SoundCraft's own; third-party plug-ins (CLAP, VST3, AU) and recording from inputs need the desktop app.
 - Browsers start audio only after a click or key press, so playback may need one click first. Large sessions use a lot of memory in the browser.
 

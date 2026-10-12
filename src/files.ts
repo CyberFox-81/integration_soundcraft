@@ -35,7 +35,7 @@ const MIME_TYPES = new Set([
 ])
 
 /** Extensions SoundCraft opens whatever their MIME type; keep in sync with Application::EXTENSIONS. */
-const EXTENSIONS = new Set(['scraft', 'wav', 'wave', 'bwf', 'aif', 'aiff', 'aifc', 'flac', 'mp3', 'ogg', 'oga', 'm4a', 'aac', 'caf'])
+const EXTENSIONS = new Set(['scraftz', 'scraft', 'wav', 'wave', 'bwf', 'aif', 'aiff', 'aifc', 'flac', 'mp3', 'ogg', 'oga', 'm4a', 'aac', 'caf'])
 
 /**
  * A file SoundCraft opens, in the user's own file tree (not the trash bin, versions or a

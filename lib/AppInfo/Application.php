@@ -46,6 +46,7 @@ class Application extends App implements IBootstrap {
 	 * know show up as application/octet-stream). Lower case, without the dot.
 	 */
 	public const EXTENSIONS = [
+		'scraftz',
 		'scraft',
 		'wav',
 		'wave',

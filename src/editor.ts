@@ -69,7 +69,7 @@ let openByDefault = loadState<boolean>(APP, 'openByDefault', false)
  * Formats that keep the whole session. Saving in one of them can make that file the session's
  * file; anything else (PDF, PNG…) is an export, a copy that leaves the session where it is.
  */
-const DOCUMENT_EXTENSIONS = new Set<string>(['.scraft'])
+const DOCUMENT_EXTENSIONS = new Set<string>(['.scraftz', '.scraft'])
 
 /**
  * Where a plain Save goes, by the file name SoundCraft saves under: the opened file's name at
@@ -556,7 +556,7 @@ async function askSavePath(name: string, startFolder: string, reason: SaveReason
 		saveAs: '',
 		export: t('integration_soundcraft', 'The export is a copy; your session stays as it is.'),
 		readOnly: t('integration_soundcraft', 'You can’t change {name}, but you can save your edits as a new file.', { name: basename(documentPath) }, { escape: false }),
-		newFormat: t('integration_soundcraft', 'SoundCraft saves {name} in a different format, so it goes to a new file and the original stays as it is.', { name: basename(documentPath) }, { escape: false }),
+		newFormat: t('integration_soundcraft', 'SoundCraft saves {name} as a session bundle (.scraftz: the session and its audio in one file), so it goes to a new file and the original stays as it is.', { name: basename(documentPath) }, { escape: false }),
 		copy: '',
 	}[reason]
 	hint.hidden = hint.textContent === ''

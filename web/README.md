@@ -25,13 +25,13 @@ Started with `?host=parent` inside an iframe, SoundCraft talks to its parent win
 | `soundcraft:dirty` | SoundCraft → parent | `dirty` (boolean) | Unsaved changes appeared or went away. |
 | `soundcraft:failed` | SoundCraft → parent | `error` | The app couldn't start (for example, no WebGPU or WebGL2). |
 
-Files the parent sends, and everything SoundCraft writes, go by their paths on the parent's side (`/Music/Song.wav`), through the engine's in-memory files. Before a session opens, SoundCraft asks for the audio it uses:
+SoundCraft's browser build saves a session as one bundle file (`.scraftz`) and hands every saved or exported file to its delivery hook; with `?host=parent` the hook sends it to the parent as `soundcraft:save` (by file name). Before a session saved in a folder (`.scraft`) opens, SoundCraft asks for the audio it uses:
 
 | Message | Direction | Fields | Meaning |
 |---|---|---|---|
-| `soundcraft:need` | SoundCraft → parent | `paths` | Audio files an opened session uses. |
+| `soundcraft:need` | SoundCraft → parent | `paths` | Audio files a `.scraft` session uses, as paths on the parent's side. |
 | `soundcraft:file` | parent → SoundCraft | `path`, `blob` or `error` | One of them, or why it can't be had (it opens as missing). |
 
-`soundcraft:open` also carries `path` and sends a `Blob` rather than bytes; an audio file opens as a new session whose Save goes next to it. Every `soundcraft:save` is named by its path, with `quiet: true` for the audio saved along with a session in its `Audio Files` folder. In host mode the demo session doesn't open, audio files dropped on the window are imported, and the parent guards leaving the page.
+`soundcraft:open` also carries `path` and sends a `Blob` rather than bytes; an audio file opens as a new session whose Save makes a bundle. In host mode the demo session doesn't open, and the parent guards leaving the page.
 
 Without `?host=parent`, SoundCraft behaves exactly as upstream: saved files download.
