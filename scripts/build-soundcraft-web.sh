@@ -23,7 +23,7 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOUNDCRAFT_REF="${SOUNDCRAFT_REF:-6cf896e76c0ec82a11bf2494f209cfe7c8507f74}"
+SOUNDCRAFT_REF="${SOUNDCRAFT_REF:-3a28a657692c1b98b28c276d8f61df9471074f0f}"
 SRC="${1:-$APP_DIR/build/soundcraft}"
 PATCH="$APP_DIR/patches/soundcraft-nextcloud.patch"
 OUT="$APP_DIR/web"
