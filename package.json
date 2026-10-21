@@ -1,6 +1,6 @@
 {
   "name": "integration_soundcraft",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Edit audio and SoundCraft sessions in Nextcloud with SoundCraft",
   "license": "AGPL-3.0-or-later",
