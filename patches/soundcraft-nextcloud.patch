@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 1b39246..0a7643e 100644
+index 0a54619..7ea2032 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -3805,13 +3805,16 @@ dependencies = [
+@@ -4380,13 +4380,16 @@ dependencies = [
   "log",
   "rfd",
   "serde_json",
@@ -20,17 +20,17 @@ index 1b39246..0a7643e 100644
  
  [[package]]
 diff --git a/apps/soundcraft-web/Cargo.toml b/apps/soundcraft-web/Cargo.toml
-index 50ff3aa..d0b22db 100644
+index 501c026..52f6886 100644
 --- a/apps/soundcraft-web/Cargo.toml
 +++ b/apps/soundcraft-web/Cargo.toml
 @@ -18,6 +18,9 @@ soundcraft-engine = { workspace = true }
- soundcraft-ui-egui = { workspace = true }
+ soundcraft-ui-egui.workspace = true
  soundcraft-playback = { workspace = true }
  soundcraft-model = { workspace = true }
 +soundcraft-audio-io = { workspace = true }
 +soundcraft-time = { workspace = true }
 +zip = { workspace = true }
- egui = { workspace = true }
+ egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
  log = { workspace = true }
  serde_json = { workspace = true }
 @@ -27,4 +30,4 @@ js-sys = "0.3"
@@ -387,7 +387,7 @@ index 6e52278..8cac06f 100644
  mod web;
  
 diff --git a/apps/soundcraft-web/src/web.rs b/apps/soundcraft-web/src/web.rs
-index 0d9b648..13f81fe 100644
+index 0f3bf2e..7188045 100644
 --- a/apps/soundcraft-web/src/web.rs
 +++ b/apps/soundcraft-web/src/web.rs
 @@ -14,8 +14,14 @@ const LOADING_ID: &str = "soundcraft_loading";
@@ -459,7 +459,7 @@ index 0d9b648..13f81fe 100644
  }
  
  impl WebShell {
-@@ -193,6 +214,9 @@ impl WebShell {
+@@ -194,6 +215,9 @@ impl WebShell {
  
  impl eframe::App for WebShell {
      fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -469,3 +469,51 @@ index 0d9b648..13f81fe 100644
          self.take_drops(ctx);
          self.take_path_prompt(ctx);
          let pending = std::mem::take(&mut *self.inbox.borrow_mut());
+diff --git a/crates/engine/src/io.rs b/crates/engine/src/io.rs
+index 76a33c7..492d8a8 100644
+--- a/crates/engine/src/io.rs
++++ b/crates/engine/src/io.rs
+@@ -72,7 +72,21 @@ pub fn file_found(path: impl AsRef<Path>) -> bool {
+ /// Paths the person picks in this session (imports) are not stored paths and skip this.
+ pub fn stored_path(stored: &str, session: &Path) -> std::result::Result<PathBuf, String> {
+     let session = std::path::absolute(session).unwrap_or_else(|_| session.to_path_buf());
+-    craft_docpath::resolve_absolute(stored, Some(&session)).map_err(|why| format!("not opened: {why}"))
++    resolve_absolute(stored, &session).map_err(|why| format!("not opened: {why}"))
++}
++
++/// `craft_docpath::resolve_absolute`, with a rooted path (`/a/b`) counting as absolute everywhere
++/// but on Windows. It asks `Path::is_absolute`, which wants a Windows prefix on
++/// wasm32-unknown-unknown and so is never true there: every path a session stores would be
++/// refused in the web build.
++fn resolve_absolute(stored: &str, session: &Path) -> std::result::Result<PathBuf, craft_docpath::Refused> {
++    let path = craft_docpath::resolve(stored, Some(session))?;
++    if is_rooted(&path) { Ok(path) } else { Err(craft_docpath::Refused::Invalid) }
++}
++
++/// Whether `path` is absolute on the running platform (see [`resolve_absolute`]).
++fn is_rooted(path: &Path) -> bool {
++    if cfg!(windows) { path.is_absolute() } else { path.has_root() }
+ }
+ 
+ /// Create `dir` and its parents, inside the automation write root when there is one.
+diff --git a/crates/engine/src/io/session.rs b/crates/engine/src/io/session.rs
+index f92b862..76840ed 100644
+--- a/crates/engine/src/io/session.rs
++++ b/crates/engine/src/io/session.rs
+@@ -357,6 +357,16 @@ mod open_tests {
+         assert_eq!(std::fs::read_dir(dir.join("copy/Audio Files")).unwrap().count(), 1);
+         let _ = std::fs::remove_dir_all(&dir);
+     }
++    /// A rooted path is absolute without asking `Path::is_absolute`, which is never true on
++    /// wasm32-unknown-unknown (where every stored audio path was refused).
++    #[cfg(not(windows))]
++    #[test]
++    fn rooted_session_paths_are_followed() {
++        let session = Path::new("/host/Music/Song.scraft");
++        assert_eq!(stored_path("Audio Files/k.wav", session), Ok(PathBuf::from("/host/Music/Audio Files/k.wav")));
++        assert_eq!(stored_path("/host/Music/k.wav", session), Ok(PathBuf::from("/host/Music/k.wav")));
++    }
++
+     #[test]
+     fn stored_paths_are_taken_from_the_session_folder() {
+         let session = std::env::temp_dir().join("s").join("Song.scraft");
